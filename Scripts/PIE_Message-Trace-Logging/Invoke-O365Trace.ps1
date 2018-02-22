@@ -178,6 +178,9 @@ function GetSubfolders($Parent) {
     }
 }
 
+# Json Controls
+$writeJSON = $true #set to $false to not output Json log to case folder
+
 
 # ================================================================================
 # Office 365 API Authentication
@@ -215,6 +218,8 @@ try {
 # ================================================================================
 
 if ( $log -eq $true) {
+    # Setup Object for JSON output
+    $json = New-Object -TypeName psobject -Property @{}
 
     # scrape all mail - ongiong log generation
     $messageTrace = Get-MessageTrace -StartDate $inceptionDate -EndDate $date | Select MessageTraceID,Received,*Address,*IP,Subject,Status,Size,MessageID | Sort-Object Received
@@ -569,6 +574,28 @@ Case Folder:                 $caseID
         type $analysisLog >> "$caseFolder$caseID\message-trace-logs.csv"
         del "$tmpFolder\*"
 
+        # Build Json Summary
+        $json | Add-Member -ErrorAction Continue -Name 'summary' -MemberType NoteProperty -Value (New-Object -TypeName psobject -Property @{
+            reportedBy=$reportedBy;
+            date=$date;
+            spammer=$spammer;
+            spammerDisplayName=$spammerDisplayName;
+            subject=$subject;
+            counts= (New-Object -TypeName psobject -Property @{
+                sent=$messageCount;
+                delivered=$delivered;
+            })
+        })
+
+        # Build Json Metadata
+        $json | Add-Member -ErrorAction Continue -Name 'meta' -MemberType NoteProperty -Value (New-Object -TypeName psobject -Property @{
+            subjects=[string[]]($subjects);
+            recipients=[string[]]($recipients);
+            links=[string[]](type "$tmpFolder\links.txt");
+            body=$messageBody;
+            headers=$headers;
+        })
+
 
 # ================================================================================
 # LOGRHYTHM CASE MANAGEMENT AND THIRD PARTY INTEGRATIONS
@@ -592,6 +619,12 @@ Case Folder:                 $caseID
         echo "Case #:      $caseNumber" >> "$caseFolder$caseID\spam-report.txt"
         echo "Case URL:    $caseURL" >> "$caseFolder$caseID\spam-report.txt"
         echo "" >> "$caseFolder$caseID\spam-report.txt"
+
+        # Build Json Case Info
+        $json | Add-Member -ErrorAction Continue -Name 'case' -MemberType NoteProperty -Value (New-Object -TypeName psobject -Property @{
+            number=$caseNumber;
+            url=$caseURL;
+        })
 
         # Copy raw logs to case
         $caseNote = type $analysisLog
@@ -620,11 +653,15 @@ Case Folder:                 $caseID
             $labsSummary = "Phishing email from $spammer was reported on $date by $reportedBy. The subject of the email is ($subject). Initial analysis shows that $messageCount user(s) received this email in the past 48 hours. For more information, review the LogRhythm Case (https://usbo1plrwc01.schq.secious.com/cases/$caseNumber) and Evidence folder ($networkShare)"
             & $pieFolder\plugins\Case-API.ps1 -lrhost $LogRhythmHost -command add_note -casenum $caseNumber -note "Tasks Created in Wrike..." -token $caseAPItoken
 
+            #TODO: Store Json Info
         }
 
         # SCREENSHOT MACHINE
         if ( $screenshotMachine -eq $true ) {
 
+            # Build Screenshots Json Container
+            $json | Add-Member -ErrorAction Continue -Name 'screenshot' -MemberType NoteProperty -Value (New-Object -TypeName psobject -Property @())
+            
             $links | ForEach-Object {
                 $splitLink = ([System.Uri]"$_").Host
 
@@ -632,12 +669,18 @@ Case Folder:                 $caseID
                     
                 $screenshotStatus = "Screenshot of hxxp://$splitLink website has been captured and saved with the case folder: screenshot-$splitLink.png"
                 & $pieFolder\plugins\Case-API.ps1 -lrhost $LogRhythmHost -command add_note -casenum $caseNumber -note "$screenshotStatus" -token $caseAPItoken
+                
+                # Build Json Screenshot
+                $json.screenshot | Add-Member -ErrorAction Continue -Name $splitLink -MemberType NoteProperty -Value "$caseFolder$caseID\screenshot-$splitLink.png"
             }
         }
 
         # GET LINK INFO
         if ( $getLinkInfo -eq $true ) {
-            
+
+            # Build LINK INFO Json Container
+            $json | Add-Member -ErrorAction Continue -Name 'linkInfo' -MemberType NoteProperty -Value (New-Object -TypeName psobject -Property @())
+
             $links | ForEach-Object { 
                 $splitLink = $_.Split(":") | findstr -v http
 
@@ -658,11 +701,20 @@ Case Folder:                 $caseID
                 echo "" >> "$caseFolder$caseID\spam-report.txt"
                 echo $getLinkInfoStatus >> "$caseFolder$caseID\spam-report.txt"
                 echo "" >> "$caseFolder$caseID\spam-report.txt"
+                
+                # Build Json Link Info
+                $json.linkInfo | Add-Member -ErrorAction Continue -Name $splitLink -MemberType NoteProperty -Value (New-Object -TypeName psobject -Property @{
+                    safe=$isItSafe -eq $false;
+                    more="http://www.getlinkinfo.com/info?link=$_";
+                })
             }
         }
 
         # PHISHTANK
         if ( $phishTank -eq $true ) {
+
+            # Build phishTank Json Container
+            $json | Add-Member -ErrorAction Continue -Name 'phishTank' -MemberType NoteProperty -Value (New-Object -TypeName psobject -Property @())
 
             $links | ForEach-Object { 
                 $splitLink = $_.Split(":") | findstr -v http
@@ -681,11 +733,14 @@ Case Folder:                 $caseID
                 $phishTankDetails = $phishTankDetails.Split("\[")[2]
                 $phishTankDetails = $phishTankDetails.Split("]")[0]
 
+                $phishTankFound = $false
                 if ( $phishTankStatus -eq "false" ) {
                     $phishTankStatus = "Link (hxxp:$splitLink) is not present in the PhishTank Database."
+                    $phishTankFound = $false
                 } elseif ( $phishTankStatus -eq "true" ) {
                     $phishTankStatus = "MALICIOUS LINK (hxxp:$splitLink) was found in the PhishTank Database! More Information: $phishTankDetails"
                     $threatScore += 1
+                    $phishTankFound = $true
                 }
 
                 & $pieFolder\plugins\Case-API.ps1 -lrhost $LogRhythmHost -command add_note -casenum $caseNumber -note "$phishTankStatus" -token $caseAPItoken
@@ -696,12 +751,21 @@ Case Folder:                 $caseID
                 echo "" >> "$caseFolder$caseID\spam-report.txt"
                 echo $phishTankStatus >> "$caseFolder$caseID\spam-report.txt"
                 echo "" >> "$caseFolder$caseID\spam-report.txt"
+                
+                # Build Json PhishTank Info
+
+                $json.phishTank | Add-Member -ErrorAction Continue -Name $splitLink -MemberType NoteProperty -Value (New-Object -TypeName psobject -Property @{
+                    found=$phishTankFound;
+                    details=$phishTankDetails;
+                })
             }
         }
 
         # SUCURI LINK ANALYSIS
         if ( $sucuri -eq $true ) {
-
+        
+            # Build LINK INFO Json Container
+            $json | Add-Member -ErrorAction Continue -Name 'sucuri' -MemberType NoteProperty -Value (New-Object -TypeName psobject -Property @{})
             $links | ForEach-Object {
                 $splitLink = ([System.Uri]"$_").Host
                     
@@ -728,6 +792,12 @@ Case Folder:                 $caseID
                 echo "" >> "$caseFolder$caseID\spam-report.txt"
                 echo $sucuriStatus >> "$caseFolder$caseID\spam-report.txt"
                 echo "" >> "$caseFolder$caseID\spam-report.txt"
+
+                # Build Json Link Info
+                $json.sucuri | Add-Member -ErrorAction Continue -Name $splitLink -MemberType NoteProperty -Value (New-Object -TypeName psobject -Property @{
+                    safe=$isitblacklisted -eq $false;
+                    more=$sucuriLink;
+                })
             }
         }
 
@@ -789,6 +859,7 @@ Case Folder:                 $caseID
                 echo $domainToolsUpdate >> "$caseFolder$caseID\spam-report.txt"
                 echo "" >> "$caseFolder$caseID\spam-report.txt"
             }
+            #TODO: add JSON output
         }
 
         # OPEN DNS
@@ -821,11 +892,15 @@ Case Folder:                 $caseID
                 echo $OpenDNSStatus >> "$caseFolder$caseID\spam-report.txt"
                 echo "" >> "$caseFolder$caseID\spam-report.txt"
             }
+            #TODO: add JSON output
         }
 
         # URL VOID
         if ( $urlVoid -eq $true ) {
             
+            # Build LINK INFO Json Container
+            $json | Add-Member -ErrorAction Continue -Name 'urlVoid' -MemberType NoteProperty -Value (New-Object -TypeName psobject -Property @{})
+
             $links | ForEach-Object {
                 
                 $splitLink = ([System.Uri]"$_").Host
@@ -892,6 +967,12 @@ Case Folder:                 $caseID
                 echo "" >> "$caseFolder$caseID\spam-report.txt"
                 echo $urlVoidIPdetails >> "$caseFolder$caseID\spam-report.txt"
                 echo "" >> "$caseFolder$caseID\spam-report.txt"
+
+                # Build Json Link Info
+                $json.urlVoid | Add-Member -ErrorAction Continue -Name $splitLink -MemberType NoteProperty -Value (New-Object -TypeName psobject -Property @{
+                    safe=$isItSafe -eq $false;
+                    details=$urlVoidIPdetails;
+                })
             }
         }
 
@@ -900,6 +981,9 @@ Case Folder:                 $caseID
 
             if ( $virusTotalAPI ) {
             
+                # Build LINK INFO Json Container
+                $json | Add-Member -ErrorAction Continue -Name 'virusTotal' -MemberType NoteProperty -Value (New-Object -TypeName psobject -Property @{})
+
                 $links | ForEach-Object {
                     $splitLink = $_.Split(":") | findstr -v http
 
@@ -930,7 +1014,13 @@ Case Folder:                 $caseID
                     echo "" >> "$caseFolder$caseID\spam-report.txt"
                     echo $VTStatus >> "$caseFolder$caseID\spam-report.txt"
                     echo "" >> "$caseFolder$caseID\spam-report.txt"
-
+                    
+                    # Build Json Link Info
+                    $json.virusTotal | Add-Member -ErrorAction Continue -Name $splitLink -MemberType NoteProperty -Value (New-Object -TypeName psobject -Property @{
+                        safe=$VTPositives -lt 1;
+                        positives=$VTPositives;
+                        more=$VTLink;
+                    })
                 }
             } else { 
                 & $pieFolder\plugins\Case-API.ps1 -lrhost $LogRhythmHost -command add_note -casenum $caseNumber -note "VirusTotal API key required to check / submit samples" -token $caseAPItoken
@@ -976,6 +1066,8 @@ Case Folder:                 $caseID
                     & $pieFolder\plugins\Case-API.ps1 -lrhost $LogRhythmHost -command add_note -casenum $caseNumber -note "$shortLinkStatus" -token $caseAPItoken
                 }
             }
+            
+            #TODO: add JSON output
         }
 
         # Link RegEx Check
@@ -1070,6 +1162,7 @@ Case Folder:                 $caseID
                 echo $regExCheckStatus >> "$caseFolder$caseID\spam-report.txt"
                 echo "" >> "$caseFolder$caseID\spam-report.txt"
             }
+            #TODO: add JSON output
         }
 
         # THREAT GRID
@@ -1143,6 +1236,13 @@ Case Folder:                 $caseID
             echo "" >> "$caseFolder$caseID\spam-report.txt"
             echo $autoQuarantineNote >> "$caseFolder$caseID\spam-report.txt"
             echo "" >> "$caseFolder$caseID\spam-report.txt"
+            
+
+            # Build Json Actions Log
+            $json | Add-Member -ErrorAction Continue -Name 'autoQuarantine' -MemberType NoteProperty -Value (New-Object -TypeName psobject -Property @{
+                quarantined=$threatScore -gt $threatThreshold;
+                note=$autoQuarantineNote;
+            })
         }
 
         if ( $autoBan -eq $true ) {
@@ -1169,6 +1269,11 @@ Case Folder:                 $caseID
             echo "" >> "$caseFolder$caseID\spam-report.txt"
             echo $autobanNote >> "$caseFolder$caseID\spam-report.txt"
             echo "" >> "$caseFolder$caseID\spam-report.txt"
+            
+            $json | Add-Member -ErrorAction Continue -Name 'autoBan' -MemberType NoteProperty -Value (New-Object -TypeName psobject -Property @{
+                quarantined=$threatScore -gt $threatThreshold;
+                note=$autobanNote;
+            })
         }
 
         # ================================================================================
@@ -1190,6 +1295,13 @@ Case Folder:                 $caseID
         $networkShare = "\\\\$hostname\\cases\\$caseID\\"
         & $pieFolder\plugins\Case-API.ps1 -lrhost $LogRhythmHost -command add_note -casenum $caseNumber -note "Case Details: $networkShare" -token $caseAPItoken
         
+        # Finish the json Object
+        $json | Add-Member -ErrorAction Continue -Name 'threatScore' -MemberType NoteProperty -Value $threatScore
+        $json | Add-Member -ErrorAction Continue -Name 'hostname' -MemberType NoteProperty -Value $hostname
+        $json | Add-Member -ErrorAction Continue -Name 'networkShare' -MemberType NoteProperty -Value $networkShare
+
+        # Finally save out Case
+        $json | ConvertTo-Json >> "$caseFolder$caseID\spam-report.json"
         }
 }
 
